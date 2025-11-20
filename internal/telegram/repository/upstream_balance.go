@@ -220,7 +220,7 @@ func (r *MongoUpstreamBalanceRepository) EnsureIndexes(ctx context.Context) erro
 		},
 		{
 			Keys:    bson.D{{Key: "chat_id", Value: 1}, {Key: "operation_id", Value: 1}},
-			Options: options.Index().SetUnique(true).SetPartialFilterExpression(bson.M{"operation_id": bson.M{"$ne": ""}}),
+			Options: options.Index().SetUnique(true).SetPartialFilterExpression(bson.M{"operation_id": bson.M{"$exists": true, "$ne": ""}}),
 		},
 	}
 
