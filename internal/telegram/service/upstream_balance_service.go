@@ -89,6 +89,10 @@ func (s *upstreamBalanceService) SetMinBalance(ctx context.Context, chatID int64
 }
 
 func (s *upstreamBalanceService) SettleDaily(ctx context.Context, group *models.Group, targetDate time.Time) (*SettlementResult, error) {
+	if s.paymentService == nil {
+		return nil, fmt.Errorf("支付服务未配置，无法执行日结")
+	}
+
 	bindings := group.Settings.InterfaceBindings
 	if len(bindings) == 0 {
 		return nil, fmt.Errorf("当前群未绑定任何接口")
