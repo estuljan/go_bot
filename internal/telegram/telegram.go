@@ -62,6 +62,7 @@ type Bot struct {
 
 	dailySummaryScheduler  *dailySummaryScheduler
 	upstreamDailyScheduler *upstreamDailyScheduler
+	upstreamBalanceWatcher *upstreamBalanceWatcher
 
 	// Repository 层（仅用于初始化）
 	userRepo            repository.UserRepository
@@ -176,6 +177,7 @@ func New(cfg Config, db *mongo.Database, paymentSvc paymentservice.Service) (*Bo
 
 	telegramBot.initDailySummaryScheduler(cfg.DailyBillPushEnabled)
 	telegramBot.initUpstreamDailyScheduler()
+	telegramBot.initUpstreamBalanceWatcher()
 
 	logger.L().Info("Telegram bot initialized successfully")
 	return telegramBot, nil
@@ -239,6 +241,11 @@ func (b *Bot) Stop(ctx context.Context) error {
 	if b.upstreamDailyScheduler != nil {
 		b.upstreamDailyScheduler.stop()
 		b.upstreamDailyScheduler = nil
+	}
+
+	if b.upstreamBalanceWatcher != nil {
+		b.upstreamBalanceWatcher.stop()
+		b.upstreamBalanceWatcher = nil
 	}
 
 	// bot.Stop() 通过 context 取消实现

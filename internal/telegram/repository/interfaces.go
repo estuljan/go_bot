@@ -123,15 +123,16 @@ type AccountingRepository interface {
 	// DeleteAllByChatID 清空群组所有记录
 	DeleteAllByChatID(ctx context.Context, chatID int64) (int64, error)
 
-        // EnsureIndexes 确保索引存在
-        EnsureIndexes(ctx context.Context) error
+	// EnsureIndexes 确保索引存在
+	EnsureIndexes(ctx context.Context) error
 }
 
 // UpstreamBalanceRepository 上游群余额数据接口
 type UpstreamBalanceRepository interface {
-        GetBalance(ctx context.Context, chatID int64) (*models.UpstreamBalance, error)
-        AdjustBalance(ctx context.Context, chatID, userID int64, delta float64, entryType, remark string) (*models.UpstreamBalance, error)
-        SetMinBalance(ctx context.Context, chatID int64, min float64) (*models.UpstreamBalance, error)
-        ListBalances(ctx context.Context) ([]*models.UpstreamBalance, error)
-        EnsureIndexes(ctx context.Context) error
+	GetBalance(ctx context.Context, chatID int64) (*models.UpstreamBalance, error)
+	AdjustBalance(ctx context.Context, chatID, userID int64, delta float64, entryType, remark, operationID string) (*models.UpstreamBalance, error)
+	SetMinBalance(ctx context.Context, chatID int64, min float64) (*models.UpstreamBalance, error)
+	SetAlertLimit(ctx context.Context, chatID int64, limit int) (*models.UpstreamBalance, error)
+	ListBalances(ctx context.Context) ([]*models.UpstreamBalance, error)
+	EnsureIndexes(ctx context.Context) error
 }

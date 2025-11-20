@@ -53,6 +53,8 @@ func (b *Bot) registerHandlers() {
 		b.asyncHandler(b.RequireAdmin(b.handleUpstreamDailySettlement)))
 	b.bot.RegisterHandler(bot.HandlerTypeMessageText, "/set_min_balance", bot.MatchTypePrefix,
 		b.asyncHandler(b.RequireAdmin(b.handleUpstreamMinBalance)))
+	b.bot.RegisterHandler(bot.HandlerTypeMessageText, "/set_balance_alert_limit", bot.MatchTypePrefix,
+		b.asyncHandler(b.RequireAdmin(b.handleUpstreamAlertLimit)))
 
 	// 配置菜单回调查询处理器
 	b.bot.RegisterHandlerMatchFunc(func(update *botModels.Update) bool {
@@ -1169,7 +1171,7 @@ func (b *Bot) handleUpstreamMinBalance(ctx context.Context, botInstance *bot.Bot
 		return
 	}
 
-	balance, err := b.upstreamBalanceService.SetMinBalance(ctx, chatID, value)
+	balance, err := b.upstreamBalanceService.SetMinBalance(ctx, chatID, update.Message.From.ID, value)
 	if err != nil {
 		logger.L().Errorf("Failed to set min balance: chat_id=%d err=%v", chatID, err)
 		b.sendErrorMessage(ctx, chatID, "配置最低余额失败")
@@ -1179,6 +1181,39 @@ func (b *Bot) handleUpstreamMinBalance(ctx context.Context, botInstance *bot.Bot
 	message := fmt.Sprintf("✅ 最低余额已设置为 %.2f\n当前余额：%.2f", balance.MinBalance, balance.Balance)
 	if balance.Balance < balance.MinBalance {
 		message = fmt.Sprintf("%s\n⚠️ 当前余额已低于阈值，请及时补足。", message)
+	}
+
+	b.sendSuccessMessage(ctx, chatID, message)
+}
+
+func (b *Bot) handleUpstreamAlertLimit(ctx context.Context, botInstance *bot.Bot, update *botModels.Update) {
+	if update.Message == nil {
+		return
+	}
+
+	chatID := update.Message.Chat.ID
+	parts := strings.Fields(strings.TrimSpace(update.Message.Text))
+	if len(parts) < 2 {
+		b.sendErrorMessage(ctx, chatID, "请提供每小时告警次数上限，例如 /set_balance_alert_limit 3")
+		return
+	}
+
+	limit, err := strconv.Atoi(parts[1])
+	if err != nil || limit <= 0 {
+		b.sendErrorMessage(ctx, chatID, "告警次数需为大于0的整数")
+		return
+	}
+
+	balance, err := b.upstreamBalanceService.SetAlertLimit(ctx, chatID, update.Message.From.ID, limit)
+	if err != nil {
+		logger.L().Errorf("Failed to set balance alert limit: chat_id=%d err=%v", chatID, err)
+		b.sendErrorMessage(ctx, chatID, "配置告警次数失败")
+		return
+	}
+
+	message := fmt.Sprintf("✅ 告警频率已更新，每小时最多 %d 条\n当前余额：%.2f\n最低余额：%.2f", balance.AlertLimitPerHour, balance.Balance, balance.MinBalance)
+	if balance.MinBalance <= 0 {
+		message = fmt.Sprintf("%s\n提示：请先使用 /set_min_balance 配置最低余额。", message)
 	}
 
 	b.sendSuccessMessage(ctx, chatID, message)
