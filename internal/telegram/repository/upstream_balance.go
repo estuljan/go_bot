@@ -15,6 +15,8 @@ import (
 	"go.mongodb.org/mongo-driver/mongo/readconcern"
 )
 
+var errOperationAlreadyApplied = errors.New("operation already applied")
+
 // MongoUpstreamBalanceRepository 上游群余额 Mongo 实现
 type MongoUpstreamBalanceRepository struct {
 	db              *mongo.Database
@@ -45,7 +47,7 @@ func (r *MongoUpstreamBalanceRepository) GetBalance(ctx context.Context, chatID 
 }
 
 // AdjustBalance 调整余额并记录日志（事务内）
-func (r *MongoUpstreamBalanceRepository) AdjustBalance(ctx context.Context, chatID, userID int64, delta float64, entryType, remark string) (*models.UpstreamBalance, error) {
+func (r *MongoUpstreamBalanceRepository) AdjustBalance(ctx context.Context, chatID, userID int64, delta float64, entryType, remark, operationID string) (*models.UpstreamBalance, error) {
 	session, err := r.db.Client().StartSession()
 	if err != nil {
 		return nil, fmt.Errorf("failed to start session: %w", err)
@@ -57,13 +59,33 @@ func (r *MongoUpstreamBalanceRepository) AdjustBalance(ctx context.Context, chat
 	_, err = session.WithTransaction(ctx, func(sc mongo.SessionContext) (interface{}, error) {
 		now := time.Now()
 
+		if operationID != "" {
+			var existingLog models.UpstreamBalanceLog
+			err := r.balanceLogsColl.FindOne(sc, bson.M{"chat_id": chatID, "operation_id": operationID}).Decode(&existingLog)
+			if err == nil {
+				var balance models.UpstreamBalance
+				if err := r.balanceColl.FindOne(sc, bson.M{"chat_id": chatID}).Decode(&balance); err != nil {
+					if errors.Is(err, mongo.ErrNoDocuments) {
+						return nil, fmt.Errorf("balance not found for existing operation: %w", err)
+					}
+					return nil, fmt.Errorf("failed to load balance for existing operation: %w", err)
+				}
+				updated = &balance
+				return nil, errOperationAlreadyApplied
+			}
+			if err != nil && !errors.Is(err, mongo.ErrNoDocuments) {
+				return nil, fmt.Errorf("failed to check existing balance log: %w", err)
+			}
+		}
+
 		update := bson.M{
 			"$inc": bson.M{"balance": delta},
 			"$set": bson.M{"updated_at": now},
 			"$setOnInsert": bson.M{
-				"chat_id":     chatID,
-				"min_balance": 0.0,
-				"created_at":  now,
+				"chat_id":              chatID,
+				"min_balance":          0.0,
+				"alert_limit_per_hour": 0,
+				"created_at":           now,
 			},
 		}
 
@@ -86,6 +108,7 @@ func (r *MongoUpstreamBalanceRepository) AdjustBalance(ctx context.Context, chat
 			BalanceAfter: balance.Balance,
 			Type:         entryType,
 			Remark:       remark,
+			OperationID:  operationID,
 			CreatedAt:    now,
 		}
 
@@ -98,6 +121,9 @@ func (r *MongoUpstreamBalanceRepository) AdjustBalance(ctx context.Context, chat
 	}, txnOpts)
 
 	if err != nil {
+		if errors.Is(err, errOperationAlreadyApplied) {
+			return updated, nil
+		}
 		return nil, err
 	}
 	return updated, nil
@@ -113,9 +139,10 @@ func (r *MongoUpstreamBalanceRepository) SetMinBalance(ctx context.Context, chat
 			"updated_at":  now,
 		},
 		"$setOnInsert": bson.M{
-			"chat_id":    chatID,
-			"balance":    0.0,
-			"created_at": now,
+			"chat_id":              chatID,
+			"balance":              0.0,
+			"alert_limit_per_hour": 0,
+			"created_at":           now,
 		},
 	}
 
@@ -125,6 +152,33 @@ func (r *MongoUpstreamBalanceRepository) SetMinBalance(ctx context.Context, chat
 			return nil, fmt.Errorf("failed to upsert min balance: %w", err)
 		}
 		return nil, fmt.Errorf("failed to update min balance: %w", err)
+	}
+	return &balance, nil
+}
+
+// SetAlertLimit 更新余额告警限频
+func (r *MongoUpstreamBalanceRepository) SetAlertLimit(ctx context.Context, chatID int64, limit int) (*models.UpstreamBalance, error) {
+	now := time.Now()
+	opts := options.FindOneAndUpdate().SetUpsert(true).SetReturnDocument(options.After)
+	update := bson.M{
+		"$set": bson.M{
+			"alert_limit_per_hour": limit,
+			"updated_at":           now,
+		},
+		"$setOnInsert": bson.M{
+			"chat_id":     chatID,
+			"balance":     0.0,
+			"min_balance": 0.0,
+			"created_at":  now,
+		},
+	}
+
+	var balance models.UpstreamBalance
+	if err := r.balanceColl.FindOneAndUpdate(ctx, bson.M{"chat_id": chatID}, update, opts).Decode(&balance); err != nil {
+		if errors.Is(err, mongo.ErrNoDocuments) {
+			return nil, fmt.Errorf("failed to upsert alert limit: %w", err)
+		}
+		return nil, fmt.Errorf("failed to update alert limit: %w", err)
 	}
 	return &balance, nil
 }
@@ -160,9 +214,15 @@ func (r *MongoUpstreamBalanceRepository) EnsureIndexes(ctx context.Context) erro
 		return fmt.Errorf("failed to create upstream balance indexes: %w", err)
 	}
 
-	logIndexes := []mongo.IndexModel{{
-		Keys: bson.D{{Key: "chat_id", Value: 1}, {Key: "created_at", Value: -1}},
-	}}
+	logIndexes := []mongo.IndexModel{
+		{
+			Keys: bson.D{{Key: "chat_id", Value: 1}, {Key: "created_at", Value: -1}},
+		},
+		{
+			Keys:    bson.D{{Key: "chat_id", Value: 1}, {Key: "operation_id", Value: 1}},
+			Options: options.Index().SetUnique(true).SetPartialFilterExpression(bson.M{"operation_id": bson.M{"$ne": ""}}),
+		},
+	}
 
 	if _, err := r.balanceLogsColl.Indexes().CreateMany(ctx, logIndexes); err != nil {
 		return fmt.Errorf("failed to create upstream balance log indexes: %w", err)
