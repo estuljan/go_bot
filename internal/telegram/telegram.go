@@ -47,26 +47,29 @@ type Bot struct {
 	tempMessageCancel    context.CancelFunc
 
 	// Service 层（业务逻辑）
-	userService       service.UserService
-	groupService      service.GroupService
-	messageService    service.MessageService
-	configMenuService *service.ConfigMenuService
-	forwardService    service.ForwardService    // 转发服务
-	accountingService service.AccountingService // 收支记账服务
-	paymentService    paymentservice.Service
+	userService            service.UserService
+	groupService           service.GroupService
+	messageService         service.MessageService
+	configMenuService      *service.ConfigMenuService
+	forwardService         service.ForwardService    // 转发服务
+	accountingService      service.AccountingService // 收支记账服务
+	upstreamBalanceService service.UpstreamBalanceService
+	paymentService         paymentservice.Service
 
 	// 功能管理器
 	featureManager *features.Manager
 	sifangFeature  *sifangfeature.Feature
 
-	dailySummaryScheduler *dailySummaryScheduler
+	dailySummaryScheduler  *dailySummaryScheduler
+	upstreamDailyScheduler *upstreamDailyScheduler
 
 	// Repository 层（仅用于初始化）
-	userRepo          repository.UserRepository
-	groupRepo         repository.GroupRepository
-	messageRepo       repository.MessageRepository
-	forwardRecordRepo repository.ForwardRecordRepository
-	accountingRepo    repository.AccountingRepository
+	userRepo            repository.UserRepository
+	groupRepo           repository.GroupRepository
+	messageRepo         repository.MessageRepository
+	forwardRecordRepo   repository.ForwardRecordRepository
+	accountingRepo      repository.AccountingRepository
+	upstreamBalanceRepo repository.UpstreamBalanceRepository
 
 	orderCascadeStates map[string]*orderCascadeState
 	orderCascadeMu     sync.RWMutex
@@ -85,6 +88,7 @@ func New(cfg Config, db *mongo.Database, paymentSvc paymentservice.Service) (*Bo
 	messageRepo := repository.NewMongoMessageRepository(db)
 	forwardRecordRepo := repository.NewForwardRecordRepository(db)
 	accountingRepo := repository.NewMongoAccountingRepository(db)
+	upstreamBalanceRepo := repository.NewMongoUpstreamBalanceRepository(db)
 
 	// 创建 services
 	userService := service.NewUserService(userRepo)
@@ -92,6 +96,7 @@ func New(cfg Config, db *mongo.Database, paymentSvc paymentservice.Service) (*Bo
 	messageService := service.NewMessageService(messageRepo, groupRepo)
 	configMenuService := service.NewConfigMenuService(groupService)
 	accountingService := service.NewAccountingService(accountingRepo, groupRepo)
+	upstreamBalanceService := service.NewUpstreamBalanceService(upstreamBalanceRepo, paymentSvc)
 
 	// 创建转发服务（如果配置了频道 ID）
 	var forwardService service.ForwardService
@@ -125,26 +130,28 @@ func New(cfg Config, db *mongo.Database, paymentSvc paymentservice.Service) (*Bo
 	}
 
 	telegramBot := &Bot{
-		bot:                  b,
-		db:                   db,
-		ownerIDs:             cfg.OwnerIDs,
-		messageRetentionDays: cfg.MessageRetentionDays,
-		workerPool:           workerPool,
-		startTime:            time.Now(),
-		userService:          userService,
-		groupService:         groupService,
-		messageService:       messageService,
-		configMenuService:    configMenuService,
-		forwardService:       forwardService,
-		accountingService:    accountingService,
-		paymentService:       paymentSvc,
-		featureManager:       featureManager,
-		userRepo:             userRepo,
-		groupRepo:            groupRepo,
-		messageRepo:          messageRepo,
-		forwardRecordRepo:    forwardRecordRepo,
-		accountingRepo:       accountingRepo,
-		orderCascadeStates:   make(map[string]*orderCascadeState),
+		bot:                    b,
+		db:                     db,
+		ownerIDs:               cfg.OwnerIDs,
+		messageRetentionDays:   cfg.MessageRetentionDays,
+		workerPool:             workerPool,
+		startTime:              time.Now(),
+		userService:            userService,
+		groupService:           groupService,
+		messageService:         messageService,
+		configMenuService:      configMenuService,
+		forwardService:         forwardService,
+		accountingService:      accountingService,
+		upstreamBalanceService: upstreamBalanceService,
+		paymentService:         paymentSvc,
+		featureManager:         featureManager,
+		userRepo:               userRepo,
+		groupRepo:              groupRepo,
+		messageRepo:            messageRepo,
+		forwardRecordRepo:      forwardRecordRepo,
+		accountingRepo:         accountingRepo,
+		upstreamBalanceRepo:    upstreamBalanceRepo,
+		orderCascadeStates:     make(map[string]*orderCascadeState),
 	}
 
 	tempCtx, tempCancel := context.WithCancel(context.Background())
@@ -168,6 +175,7 @@ func New(cfg Config, db *mongo.Database, paymentSvc paymentservice.Service) (*Bo
 	}
 
 	telegramBot.initDailySummaryScheduler(cfg.DailyBillPushEnabled)
+	telegramBot.initUpstreamDailyScheduler()
 
 	logger.L().Info("Telegram bot initialized successfully")
 	return telegramBot, nil
@@ -226,6 +234,11 @@ func (b *Bot) Stop(ctx context.Context) error {
 	if b.dailySummaryScheduler != nil {
 		b.dailySummaryScheduler.stop()
 		b.dailySummaryScheduler = nil
+	}
+
+	if b.upstreamDailyScheduler != nil {
+		b.upstreamDailyScheduler.stop()
+		b.upstreamDailyScheduler = nil
 	}
 
 	// bot.Stop() 通过 context 取消实现
@@ -298,6 +311,13 @@ func (b *Bot) ensureIndexes(ctx context.Context) error {
 	}
 	logger.L().Debug("Accounting indexes ensured")
 
+	if b.upstreamBalanceRepo != nil {
+		if err := b.upstreamBalanceRepo.EnsureIndexes(ctx); err != nil {
+			return fmt.Errorf("failed to ensure upstream balance indexes: %w", err)
+		}
+		logger.L().Debug("Upstream balance indexes ensured")
+	}
+
 	return nil
 }
 
@@ -333,6 +353,7 @@ func (b *Bot) registerFeatures() {
 	// 注册接口绑定功能
 	b.featureManager.Register(upstream.New(b.groupService, b.userService))
 	b.featureManager.Register(upstream.NewSummaryFeature(b.paymentService))
+	b.featureManager.Register(upstream.NewBalanceFeature(b.upstreamBalanceService, b.userService))
 
 	// 注册四方支付功能
 	b.sifangFeature = sifangfeature.New(b.paymentService, b.userService)

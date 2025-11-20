@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"html"
+	"strconv"
 	"strings"
 	"time"
 
@@ -46,6 +47,12 @@ func (b *Bot) registerHandlers() {
 		b.asyncHandler(b.RequireAdmin(b.handleLeave)))
 	b.bot.RegisterHandler(bot.HandlerTypeMessageText, "/configs", bot.MatchTypeExact,
 		b.asyncHandler(b.RequireAdmin(b.handleConfigs)))
+	b.bot.RegisterHandler(bot.HandlerTypeMessageText, "/余额", bot.MatchTypeExact,
+		b.asyncHandler(b.RequireAdmin(b.handleUpstreamBalanceQuery)))
+	b.bot.RegisterHandler(bot.HandlerTypeMessageText, "/日结", bot.MatchTypeExact,
+		b.asyncHandler(b.RequireAdmin(b.handleUpstreamDailySettlement)))
+	b.bot.RegisterHandler(bot.HandlerTypeMessageText, "/set_min_balance", bot.MatchTypePrefix,
+		b.asyncHandler(b.RequireAdmin(b.handleUpstreamMinBalance)))
 
 	// 配置菜单回调查询处理器
 	b.bot.RegisterHandlerMatchFunc(func(update *botModels.Update) bool {
@@ -1070,6 +1077,111 @@ func (b *Bot) handleEditedChannelPost(ctx context.Context, botInstance *bot.Bot,
 	if err := b.messageService.HandleEditedMessage(ctx, int64(post.ID), post.Chat.ID, post.Text, editedAt); err != nil {
 		logger.L().Errorf("Failed to handle edited channel post: %v", err)
 	}
+}
+
+func (b *Bot) handleUpstreamBalanceQuery(ctx context.Context, botInstance *bot.Bot, update *botModels.Update) {
+	if update.Message == nil {
+		return
+	}
+
+	chatID := update.Message.Chat.ID
+	group, err := b.groupService.GetGroupInfo(ctx, chatID)
+	if err != nil {
+		logger.L().Errorf("Failed to load group info for balance query: chat_id=%d err=%v", chatID, err)
+		b.sendErrorMessage(ctx, chatID, "获取群组信息失败")
+		return
+	}
+	if models.NormalizeGroupTier(group.Tier) != models.GroupTierUpstream {
+		b.sendErrorMessage(ctx, chatID, "仅上游群支持该命令")
+		return
+	}
+
+	balance, err := b.upstreamBalanceService.Get(ctx, chatID)
+	if err != nil {
+		logger.L().Errorf("Failed to query upstream balance: chat_id=%d err=%v", chatID, err)
+		b.sendErrorMessage(ctx, chatID, "查询余额失败")
+		return
+	}
+
+	current := 0.0
+	minBalance := 0.0
+	if balance != nil {
+		current = balance.Balance
+		minBalance = balance.MinBalance
+	}
+
+	message := fmt.Sprintf("当前余额：%.2f", current)
+	if minBalance > 0 {
+		message = fmt.Sprintf("%s\n最低余额：%.2f", message, minBalance)
+		if current < minBalance {
+			message = fmt.Sprintf("%s\n⚠️ 已低于最低余额阈值，请尽快补足。", message)
+		}
+	}
+
+	b.sendMessage(ctx, chatID, message)
+}
+
+func (b *Bot) handleUpstreamDailySettlement(ctx context.Context, botInstance *bot.Bot, update *botModels.Update) {
+	if update.Message == nil {
+		return
+	}
+
+	chatID := update.Message.Chat.ID
+	group, err := b.groupService.GetGroupInfo(ctx, chatID)
+	if err != nil {
+		logger.L().Errorf("Failed to load group info for settlement: chat_id=%d err=%v", chatID, err)
+		b.sendErrorMessage(ctx, chatID, "获取群组信息失败")
+		return
+	}
+	if models.NormalizeGroupTier(group.Tier) != models.GroupTierUpstream {
+		b.sendErrorMessage(ctx, chatID, "仅上游群支持日结")
+		return
+	}
+
+	loc := mustLoadChinaLocation()
+	targetDate := previousBillingDate(time.Now().In(loc), loc)
+
+	result, err := b.upstreamBalanceService.SettleDaily(ctx, group, targetDate)
+	if err != nil {
+		logger.L().Errorf("Upstream manual settlement failed: chat_id=%d err=%v", chatID, err)
+		b.sendErrorMessage(ctx, chatID, fmt.Sprintf("日结失败：%v", err))
+		return
+	}
+
+	message := formatUpstreamSettlementMessage(result)
+	b.sendMessageWithMarkupAndMessage(ctx, chatID, message, nil)
+}
+
+func (b *Bot) handleUpstreamMinBalance(ctx context.Context, botInstance *bot.Bot, update *botModels.Update) {
+	if update.Message == nil {
+		return
+	}
+
+	chatID := update.Message.Chat.ID
+	parts := strings.Fields(strings.TrimSpace(update.Message.Text))
+	if len(parts) < 2 {
+		b.sendErrorMessage(ctx, chatID, "请提供最低余额金额，例如 /set_min_balance 100")
+		return
+	}
+	value, err := strconv.ParseFloat(parts[1], 64)
+	if err != nil || value < 0 {
+		b.sendErrorMessage(ctx, chatID, "最低余额需为非负数")
+		return
+	}
+
+	balance, err := b.upstreamBalanceService.SetMinBalance(ctx, chatID, value)
+	if err != nil {
+		logger.L().Errorf("Failed to set min balance: chat_id=%d err=%v", chatID, err)
+		b.sendErrorMessage(ctx, chatID, "配置最低余额失败")
+		return
+	}
+
+	message := fmt.Sprintf("✅ 最低余额已设置为 %.2f\n当前余额：%.2f", balance.MinBalance, balance.Balance)
+	if balance.Balance < balance.MinBalance {
+		message = fmt.Sprintf("%s\n⚠️ 当前余额已低于阈值，请及时补足。", message)
+	}
+
+	b.sendSuccessMessage(ctx, chatID, message)
 }
 
 // handleNewChatMembers 处理新成员加入系统消息
