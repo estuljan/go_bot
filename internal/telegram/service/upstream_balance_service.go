@@ -19,14 +19,19 @@ const (
 	upstreamLogTypeManualSubtract = "manual_subtract"
 	upstreamLogTypeDaily          = "daily_settlement"
 	upstreamLogTypeThreshold      = "set_min_balance"
+	upstreamLogTypeAlertLimit     = "set_balance_alert_limit"
 )
 
 // UpstreamBalanceService 管理上游群余额与日结
 type UpstreamBalanceService interface {
+	Adjust(ctx context.Context, chatID, userID int64, delta float64, remark, operationID string) (*models.UpstreamBalance, bool, error)
 	Add(ctx context.Context, chatID, userID int64, amount float64) (*models.UpstreamBalance, bool, error)
 	Subtract(ctx context.Context, chatID, userID int64, amount float64) (*models.UpstreamBalance, bool, error)
 	Get(ctx context.Context, chatID int64) (*models.UpstreamBalance, error)
-	SetMinBalance(ctx context.Context, chatID int64, min float64) (*models.UpstreamBalance, error)
+	SetMinBalance(ctx context.Context, chatID, userID int64, min float64) (*models.UpstreamBalance, error)
+	SetAlertLimit(ctx context.Context, chatID, userID int64, limit int) (*models.UpstreamBalance, error)
+	List(ctx context.Context) ([]*models.UpstreamBalance, error)
+	BalanceChanges() <-chan *models.UpstreamBalance
 	SettleDaily(ctx context.Context, group *models.Group, targetDate time.Time) (*SettlementResult, error)
 }
 
@@ -42,6 +47,7 @@ type upstreamBalanceService struct {
 	repo           repository.UpstreamBalanceRepository
 	paymentService paymentservice.Service
 	nowFunc        func() time.Time
+	changeCh       chan *models.UpstreamBalance
 }
 
 // NewUpstreamBalanceService 创建服务
@@ -52,26 +58,37 @@ func NewUpstreamBalanceService(repo repository.UpstreamBalanceRepository, paymen
 		nowFunc: func() time.Time {
 			return time.Now().In(mustLoadChinaLocation())
 		},
+		changeCh: make(chan *models.UpstreamBalance, 32),
 	}
 }
 
+func (s *upstreamBalanceService) BalanceChanges() <-chan *models.UpstreamBalance {
+	return s.changeCh
+}
+
 func (s *upstreamBalanceService) Add(ctx context.Context, chatID, userID int64, amount float64) (*models.UpstreamBalance, bool, error) {
-	return s.adjust(ctx, chatID, userID, amount, upstreamLogTypeManualAdd)
+	return s.Adjust(ctx, chatID, userID, amount, "", "")
 }
 
 func (s *upstreamBalanceService) Subtract(ctx context.Context, chatID, userID int64, amount float64) (*models.UpstreamBalance, bool, error) {
-	return s.adjust(ctx, chatID, userID, -math.Abs(amount), upstreamLogTypeManualSubtract)
+	return s.Adjust(ctx, chatID, userID, -math.Abs(amount), "", "")
 }
 
-func (s *upstreamBalanceService) adjust(ctx context.Context, chatID, userID int64, delta float64, entryType string) (*models.UpstreamBalance, bool, error) {
+func (s *upstreamBalanceService) Adjust(ctx context.Context, chatID, userID int64, delta float64, remark, operationID string) (*models.UpstreamBalance, bool, error) {
 	if delta == 0 {
 		balance, err := s.repo.GetBalance(ctx, chatID)
 		return balance, s.shouldWarn(balance), err
 	}
-	updated, err := s.repo.AdjustBalance(ctx, chatID, userID, delta, entryType, "")
+	entryType := upstreamLogTypeManualAdd
+	if delta < 0 {
+		entryType = upstreamLogTypeManualSubtract
+	}
+	updated, err := s.repo.AdjustBalance(ctx, chatID, userID, delta, entryType, strings.TrimSpace(remark), operationID)
 	if err != nil {
 		return nil, false, err
 	}
+
+	s.publishChange(updated)
 	return updated, s.shouldWarn(updated), nil
 }
 
@@ -79,13 +96,28 @@ func (s *upstreamBalanceService) Get(ctx context.Context, chatID int64) (*models
 	return s.repo.GetBalance(ctx, chatID)
 }
 
-func (s *upstreamBalanceService) SetMinBalance(ctx context.Context, chatID int64, min float64) (*models.UpstreamBalance, error) {
+func (s *upstreamBalanceService) SetMinBalance(ctx context.Context, chatID, userID int64, min float64) (*models.UpstreamBalance, error) {
 	updated, err := s.repo.SetMinBalance(ctx, chatID, min)
 	if err != nil {
 		return nil, err
 	}
-	_, _ = s.repo.AdjustBalance(ctx, chatID, 0, 0, upstreamLogTypeThreshold, fmt.Sprintf("set_min_balance=%.2f", min))
+	_, _ = s.repo.AdjustBalance(ctx, chatID, userID, 0, upstreamLogTypeThreshold, fmt.Sprintf("set_min_balance=%.2f", min), "")
+	s.publishChange(updated)
 	return updated, nil
+}
+
+func (s *upstreamBalanceService) SetAlertLimit(ctx context.Context, chatID, userID int64, limit int) (*models.UpstreamBalance, error) {
+	updated, err := s.repo.SetAlertLimit(ctx, chatID, limit)
+	if err != nil {
+		return nil, err
+	}
+	_, _ = s.repo.AdjustBalance(ctx, chatID, userID, 0, upstreamLogTypeAlertLimit, fmt.Sprintf("set_alert_limit=%d", limit), "")
+	s.publishChange(updated)
+	return updated, nil
+}
+
+func (s *upstreamBalanceService) List(ctx context.Context) ([]*models.UpstreamBalance, error) {
+	return s.repo.ListBalances(ctx)
 }
 
 func (s *upstreamBalanceService) SettleDaily(ctx context.Context, group *models.Group, targetDate time.Time) (*SettlementResult, error) {
@@ -113,10 +145,13 @@ func (s *upstreamBalanceService) SettleDaily(ctx context.Context, group *models.
 		totalDeduction += item.Deduction
 	}
 
-	balance, err := s.repo.AdjustBalance(ctx, group.TelegramID, 0, -totalDeduction, upstreamLogTypeDaily, targetDate.Format("2006-01-02"))
+	operationID := fmt.Sprintf("daily_settlement:%d:%s", group.TelegramID, targetDate.Format("2006-01-02"))
+	balance, err := s.repo.AdjustBalance(ctx, group.TelegramID, 0, -totalDeduction, upstreamLogTypeDaily, targetDate.Format("2006-01-02"), operationID)
 	if err != nil {
 		return nil, err
 	}
+
+	s.publishChange(balance)
 
 	return &SettlementResult{
 		Balance:   balance,
@@ -153,6 +188,18 @@ func (s *upstreamBalanceService) shouldWarn(balance *models.UpstreamBalance) boo
 		return false
 	}
 	return balance.Balance < balance.MinBalance
+}
+
+func (s *upstreamBalanceService) publishChange(balance *models.UpstreamBalance) {
+	if balance == nil || s.changeCh == nil {
+		return
+	}
+
+	select {
+	case s.changeCh <- balance:
+	default:
+		logger.L().Warn("Upstream balance change channel is full, dropping event")
+	}
 }
 
 func parseRatePercent(rate string) float64 {
